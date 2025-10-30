@@ -1,0 +1,128 @@
+import logging
+from telegram import Update
+from telegram.ext import ContextTypes, Application, JobQueue
+from telegram.constants import ParseMode
+
+from .core.database import (
+    get_all_active_forward_settings,
+    get_setting_by_id,
+    update_setting_current_id,
+    update_setting_active
+)
+from .handlers.helpers import _send_message_content_by_id
+
+logger = logging.getLogger(__name__)
+
+async def process_task(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Processes a single ID_RANGE forward task.
+    This function is run by the JobQueue for each individual task.
+    """
+    setting_id = context.job.data['setting_id']
+    setting = get_setting_by_id(setting_id)
+
+    # Check if task is valid and active
+    if not setting or not setting['is_active'] or setting['task_type'] != 'id_range':
+        logger.warning(f"Task {setting_id} is inactive, not found, or not ID_RANGE. Removing job.")
+        context.job.schedule_removal()
+        return
+
+    try:
+        current_id = setting['current_message_id']
+        end_id = setting['end_message_id']
+        
+        # Check if task is complete
+        if current_id > end_id:
+            logger.info(f"Task {setting_id} (ID Range) has completed.")
+            update_setting_active(setting_id, False) # Deactivate task
+            context.job.schedule_removal() # Remove job
+            await context.bot.send_message(setting['user_id'], f"✅ Task #{setting_id} (ID Range) បានបញ្ចប់ការ Forward។ Task ត្រូវបានផ្អាក។")
+            return
+
+        logger.info(f"Task {setting_id}: Processing ID Range. Current: {current_id}")
+        
+        success = await _send_message_content_by_id(context, dict(setting))
+        
+        if success == 'not_found':
+            logger.warning(f"Task {setting_id}: Message {current_id} not found/unforwardable. Skipping.")
+        elif success:
+            logger.info(f"Task {setting_id}: Successfully forwarded message {current_id}.")
+        else:
+            # Failed (e.g., bot not admin in target), stop the task
+            logger.error(f"Task {setting_id}: Failed to forward {current_id}. Stopping task.")
+            update_setting_active(setting_id, False)
+            context.job.schedule_removal()
+            await context.bot.send_message(setting['user_id'], f"⚠️ Task #{setting_id} បានបរាជ័យក្នុងការ Forward សារ ID <code>{current_id}</code>។ Task ត្រូវបានផ្អាក។ សូមពិនិត្យមើល Channel Settings។", parse_mode=ParseMode.HTML)
+            return
+
+        # Increment to the next ID to be processed
+        next_id = current_id + setting['forward_every_n_posts']
+        update_setting_current_id(setting_id, next_id)
+
+    except Exception as e:
+        logger.error(f"Critical Error in process_task for setting {setting_id}: {e}")
+        if "chat not found" in str(e):
+            logger.error(f"Task {setting_id} failed: Chat not found. Stopping task.")
+            update_setting_active(setting_id, False)
+            context.job.schedule_removal()
+            await context.bot.send_message(setting['user_id'], f"⚠️ Task #{setting_id} ត្រូវបានផ្អាក ដោយសារ Bot រកមិនឃើញ Channel។", parse_mode=ParseMode.HTML)
+        elif "bot was blocked" in str(e):
+             logger.error(f"Task {setting_id} failed: Bot was blocked by user {setting['user_id']}.")
+             update_setting_active(setting_id, False)
+             context.job.schedule_removal()
+
+def stop_job_for_task(context: ContextTypes.DEFAULT_TYPE, setting_id: int):
+    """Stops and removes a job from the queue."""
+    jobs = context.job_queue.get_jobs_by_name(f"task_{setting_id}")
+    if not jobs:
+        logger.warning(f"No job found with name task_{setting_id} to remove.")
+        return False
+    for job in jobs:
+        job.schedule_removal()
+    logger.info(f"Removed job for task_{setting_id}")
+    return True
+
+def schedule_id_range_task(job_queue: JobQueue, setting_id: int, interval: int):
+    """Schedules a single ID range task."""
+    
+    # First, remove any existing job for this task to avoid duplicates
+    jobs = job_queue.get_jobs_by_name(f"task_{setting_id}")
+    for job in jobs:
+        job.schedule_removal()
+        
+    # Schedule the new job
+    job_queue.run_repeating(
+        process_task,
+        interval=interval,
+        first=0, # Start immediately
+        data={'setting_id': setting_id},
+        name=f"task_{setting_id}"
+    )
+    logger.info(f"Scheduled ID_RANGE task {setting_id} to run every {interval}s.")
+
+async def schedule_all_tasks(context: ContextTypes.DEFAULT_TYPE):
+    """Loads all active ID_RANGE tasks from DB and schedules them on bot startup."""
+    
+    logger.warning("--- WARNING ---")
+    logger.warning("Loading background jobs (ID Range tasks).")
+    logger.warning("If you are on a free Render plan, this web service will sleep.")
+    logger.warning("When it sleeps, these jobs will STOP.")
+    logger.warning("They will only restart when the bot is redeployed or woken up by a visit.")
+    logger.warning("For 24/7 jobs, use a Render Cron Job.")
+    logger.warning("---------------")
+    
+    application = context.application
+    settings = get_all_active_forward_settings()
+    
+    # Filter for ID_RANGE tasks only
+    id_range_settings = [s for s in settings if s['task_type'] == 'id_range']
+    
+    count = 0
+    for setting in id_range_settings:
+        schedule_id_range_task(
+            application.job_queue,
+            setting['id'],
+            setting['interval_seconds']
+        )
+        count += 1
+    logger.info(f"Scheduled {count} active ID_RANGE tasks.")
